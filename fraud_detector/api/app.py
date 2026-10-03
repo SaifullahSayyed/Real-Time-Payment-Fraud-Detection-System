@@ -14,11 +14,12 @@ Behaviours:
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError, field_validator
@@ -118,6 +119,11 @@ def create_app(
             "Money is in integer paise. Timestamps must be UTC."
         ),
         lifespan=lifespan if engine is None else _noop_lifespan(engine),
+        # Disable all auto-generated docs in production — schema exposure is a
+        # security risk on a fraud-detection API.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     # Store engine reference on app state for testability
@@ -169,6 +175,25 @@ def create_app(
                 )
 
         return await call_next(request)
+
+    # Security headers — applied to every response regardless of route
+    _CSP = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'"
+    )
+
+    @app.middleware("http")
+    async def security_headers_middleware(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = _CSP
+        return response
+
 
     # ------------------------------------------------------------------
     # Exception handlers — always return structured JSON, never crash
@@ -234,6 +259,13 @@ def create_app(
     app.state.review_queue = {}
     app.state.latencies = deque(maxlen=500)
     app.state.confusion_matrix = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
+    # Maps transaction_id -> first label applied ("FRAUD" | "LEGIT")
+    # Used to detect double-reviews and conflicting labels.
+    app.state.reviewed_transactions: dict[str, str] = {}
+    # Protects concurrent writes to confusion_matrix and reviewed_transactions.
+    app.state.review_lock = threading.Lock()
+    # Tracks all transactions scored or queued by the system to detect unknown transaction IDs
+    app.state.known_transactions: set[str] = set()
 
     # ------------------------------------------------------------------
     # Routes
@@ -276,23 +308,100 @@ def create_app(
         }
 
     @app.post("/v1/review", tags=["Operations"])
-    async def review_transaction(body: ReviewRequest):
-        """Analyst feedback endpoint. Updates confusion matrix and threshold tuning."""
-        tx_id = body.transaction_id
-        app.state.review_queue.pop(tx_id, None)
-        cm = app.state.confusion_matrix
-        if body.label == "FRAUD":
-            cm["tp"] += 1
-        else:
-            cm["fp"] += 1
+    async def review_transaction(
+        body: ReviewRequest,
+        x_analyst_token: str | None = Header(default=None, alias="X-Analyst-Token"),
+    ):
+        """Analyst feedback endpoint. Updates confusion matrix and threshold tuning.
 
-        new_thresh = app.state.decision_engine.update_from_review_feedback(
-            cm["tp"], cm["fp"], cm["tn"], cm["fn"]
+        Requires ``X-Analyst-Token`` header matching the ``ANALYST_TOKEN`` environment
+        variable (no default — must be explicitly configured).
+
+        Returns:
+          - 401 if the token header is absent or the env var is not configured.
+          - 403 if the token is present but incorrect.
+          - 404 if the transaction_id is not in the analyst review queue.
+          - 409 if a conflicting second label is submitted for the same transaction_id.
+          - 200 on success (or idempotent duplicate with same label).
+        """
+        # --- (a) Analyst token authentication ---
+        configured_token: str | None = os.environ.get("ANALYST_TOKEN")
+        if not configured_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="ANALYST_TOKEN environment variable is not configured.",
+                headers={"WWW-Authenticate": "X-Analyst-Token"},
+            )
+        if not x_analyst_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing required X-Analyst-Token header.",
+                headers={"WWW-Authenticate": "X-Analyst-Token"},
+            )
+        if x_analyst_token != configured_token:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid analyst token.",
+            )
+
+        tx_id = body.transaction_id
+
+        # --- (c) Unknown transaction → 404 ---
+        is_known = (
+            tx_id in app.state.known_transactions
+            or tx_id in app.state.review_queue
+            or tx_id in app.state.reviewed_transactions
         )
+        if not is_known:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Transaction '{tx_id}' is unknown.",
+            )
+
+        # --- (b) Double-review + conflict detection (thread-safe) ---
+        with app.state.review_lock:
+            prior_label: str | None = app.state.reviewed_transactions.get(tx_id)
+
+            if prior_label is not None:
+                if prior_label == body.label:
+                    # Idempotent: same label → return without double-counting
+                    return {
+                        "status": "success",
+                        "transaction_id": tx_id,
+                        "label": body.label,
+                        "is_duplicate": True,
+                        "thresholds": app.state.decision_engine.thresholds,
+                    }
+                else:
+                    # Conflicting label — reject with 409
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"Transaction '{tx_id}' was already labelled '{prior_label}'. "
+                            f"Conflicting label '{body.label}' rejected. "
+                            f"Submit with override=true to explicitly override."
+                        ),
+                    )
+
+            # First review for this transaction — record and update CM
+            app.state.reviewed_transactions[tx_id] = body.label
+            app.state.review_queue.pop(tx_id, None)
+
+            cm = app.state.confusion_matrix
+            if body.label == "FRAUD":
+                cm["tp"] += 1
+            else:
+                cm["fp"] += 1
+
+            new_thresh = app.state.decision_engine.update_from_review_feedback(
+                cm["tp"], cm["fp"], cm["tn"], cm["fn"]
+            )
+
         return {
             "status": "success",
             "transaction_id": tx_id,
             "label": body.label,
+            "is_duplicate": False,
             "thresholds": new_thresh,
         }
 
@@ -334,6 +443,7 @@ def create_app(
             "scored_at": score_res.scored_at.isoformat(),
         }
         app.state.recent_transactions.appendleft(record)
+        app.state.known_transactions.add(tx.transaction_id)
 
         if dec_res.decision == Decision.REVIEW:
             app.state.review_queue[tx.transaction_id] = record

@@ -70,6 +70,8 @@ def test_metrics_and_review_endpoints():
         assert "thresholds" in metrics
 
         # Submit analyst review
+        import os
+        token = os.environ.get("ANALYST_TOKEN", "test-analyst-token")
         rev_resp = client.post(
             "/v1/review",
             json={
@@ -77,6 +79,7 @@ def test_metrics_and_review_endpoints():
                 "label": "LEGIT",
                 "notes": "Verified with cardholder",
             },
+            headers={"X-Analyst-Token": token},
         )
         assert rev_resp.status_code == 200
         assert rev_resp.json()["status"] == "success"

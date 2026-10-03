@@ -57,11 +57,16 @@ class DecisionEngine:
         thresh_stepup: float = 0.30,
         thresh_review: float = 0.60,
         thresh_block: float = 0.85,
+        max_step_per_label: float = 0.02,
+        max_drift_per_hour: float = 0.10,
     ) -> None:
         self.costs = cost_matrix or CostMatrix()
         self.thresh_stepup = thresh_stepup
         self.thresh_review = thresh_review
         self.thresh_block = thresh_block
+        self.max_step_per_label = max_step_per_label
+        self.max_drift_per_hour = max_drift_per_hour
+        self._drift_history: list[tuple[float, float]] = []
 
     @property
     def thresholds(self) -> dict[str, float]:
@@ -104,11 +109,30 @@ class DecisionEngine:
         )
 
     def update_from_review_feedback(
-        self, tp: int, fp: int, tn: int, fn: int
+        self, tp: int, fp: int, tn: int, fn: int, now: float | None = None
     ) -> dict[str, float]:
-        """Recalibrate thresholds dynamically based on empirical review outcomes."""
+        """Recalibrate thresholds dynamically based on empirical review outcomes.
+
+        Guarantees:
+          • Step per label is bounded to at most `max_step_per_label` (default 0.02).
+          • Total drift across all reviews in any 1-hour rolling window is bounded
+            to at most `max_drift_per_hour` (default 0.10).
+        """
         total_eval = tp + fp + tn + fn
         if total_eval < 5:
+            return self.thresholds
+
+        import time
+        t_now = now if now is not None else time.monotonic()
+
+        # Prune drift records older than 1 hour (3600 seconds)
+        cutoff = t_now - 3600.0
+        self._drift_history = [(t, d) for t, d in self._drift_history if t > cutoff]
+        hourly_drift = sum(abs(d) for _, d in self._drift_history)
+
+        step = self.max_step_per_label
+        if hourly_drift + step > self.max_drift_per_hour:
+            # Hourly drift budget exhausted — cannot drift any further this hour
             return self.thresholds
 
         # If false positives are high, shift block and review thresholds upward
@@ -117,11 +141,13 @@ class DecisionEngine:
 
         if fp_rate > 0.08:
             # Too many false alarms: relax block and review thresholds slightly
-            self.thresh_block = min(0.92, self.thresh_block + 0.02)
-            self.thresh_review = min(0.70, self.thresh_review + 0.02)
+            self.thresh_block = min(0.92, self.thresh_block + step)
+            self.thresh_review = min(0.70, self.thresh_review + step)
+            self._drift_history.append((t_now, step))
         elif fn_rate > 0.05:
             # Too many missed frauds: tighten block and review thresholds
-            self.thresh_block = max(0.75, self.thresh_block - 0.02)
-            self.thresh_review = max(0.50, self.thresh_review - 0.02)
+            self.thresh_block = max(0.75, self.thresh_block - step)
+            self.thresh_review = max(0.50, self.thresh_review - step)
+            self._drift_history.append((t_now, -step))
 
         return self.thresholds

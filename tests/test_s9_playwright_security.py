@@ -111,7 +111,10 @@ class TestReviewEndpointValidation:
 
     def test_valid_review_accepted(self):
         """Regression: a well-formed review must still pass."""
+        import os
+        token = os.environ.get("ANALYST_TOKEN", "test-analyst-token")
         with _client() as client:
+            client.app.state.known_transactions.add("txn-valid-001")
             res = client.post(
                 "/v1/review",
                 json={
@@ -119,6 +122,7 @@ class TestReviewEndpointValidation:
                     "label": "LEGIT",
                     "notes": "Cardholder confirmed.",
                 },
+                headers={"X-Analyst-Token": token},
             )
             assert res.status_code == 200
             assert res.json()["status"] == "success"
